@@ -1,0 +1,25 @@
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+BASE="$HOME/Library/Application Support/VIDEOTV"
+
+es_nombre_valido() {
+    local nombre="$1" lower
+    lower="$(printf '%s' "$nombre" | tr '[:upper:]' '[:lower:]')"
+
+    [[ "$lower" =~ ^(videotv|video_tv)([[:space:]]\([0-9]+\)|[[:space:]][0-9]+)?$ ]] && return 0
+    [[ "$lower" =~ ^(videotv|video_tv)([[:space:]]\([0-9]+\)|[[:space:]][0-9]+)?\.zip$ ]] && return 0
+    [[ "$lower" =~ ^(videotv|video_tv)\.zip[[:space:]]?\([0-9]+\)$ ]] && return 0
+    return 1
+}
+
+for item in "$@"; do
+    nombre="$(basename "$item")"
+    [ "$nombre" = "VIDEOTV.mp4" ] && continue
+
+    if es_nombre_valido "$nombre"; then
+        # Automator solo dispara; el watcher elige la exportación válida MÁS RECIENTE.
+        nohup "$BASE/VIDEOTV_Watcher.sh" >/dev/null 2>&1 &
+        exit 0
+    fi
+done
+
+exit 0
