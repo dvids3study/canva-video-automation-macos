@@ -12,6 +12,8 @@ GUI="$BASE/VIDEOTVProgress"
 USB_ALLOWLIST="$BASE/usb_allowlist.txt"
 LAST_SUCCESS="$BASE/last_success.tsv"
 LOG="$BASE/processor.log"
+MAIL_HELPER="$BASE/VIDEOTV_Mail.sh"
+MAIL_MODE_FILE="$BASE/mail_mode.txt"
 
 mkdir -p "$BASE"
 touch "$USB_ALLOWLIST" "$LOG"
@@ -93,7 +95,16 @@ is_recent_duplicate(){
   [ "$age" -ge 0 ] && [ "$age" -le 600 ]
 }
 
-for c in ffmpeg ffprobe shasum diskutil plutil perl; do
+mail_mode() {
+  local m="off"
+  [ -f "$MAIL_MODE_FILE" ] && m=$(tr -d '[:space:]' < "$MAIL_MODE_FILE")
+  case "$m" in
+    off|preview|send) printf '%s' "$m" ;;
+    *) printf 'off' ;;
+  esac
+}
+
+for c in ffmpeg ffprobe shasum diskutil plutil awk sort; do
   command -v "$c" >/dev/null 2>&1 || fail "No encuentro $c."
 done
 
@@ -102,19 +113,34 @@ ORIGEN="${1:-}"
 [ -e "$ORIGEN" ] || fail "La descarga indicada ya no existe."
 
 status_write processing "Preparando VIDEOTV" "${ORIGEN##*/}" 3 0 ""
-launch_gui
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp/}tvx.XXXXXXXX") || fail "No pude crear la carpeta temporal."
-trap 'rm -rf "$WORK"' EXIT
+cleanup_work() {
+  rm -rf "${WORK:-}"
+  rm -f "$BASE/processor.pid" "$BASE/processor.pid.tmp.$$"
+}
+trap cleanup_work EXIT
+trap 'cleanup_work; exit 1' INT TERM
+printf '%s\n' "$$" > "$BASE/processor.pid.tmp.$$"
+mv -f "$BASE/processor.pid.tmp.$$" "$BASE/processor.pid"
+launch_gui
 mkdir -p "$WORK/source" "$WORK/clips"
 
 if [ -f "$ORIGEN" ]; then
-  status_write processing "Comprobando ZIP" "Validando la descarga" 8 0 ""
-  unzip -tq "$ORIGEN" >/dev/null 2>&1 || fail "VIDEOTV.zip está incompleto o dañado."
+  case "${ORIGEN##*.}" in
+    mp4|MP4|mov|MOV|m4v|M4V)
+      SOURCE="$ORIGEN"
+      status_write processing "Video único" "Se procesará como un solo clip" 10 0 ""
+      ;;
+    *)
+      status_write processing "Comprobando ZIP" "Validando la descarga" 8 0 ""
+      unzip -tq "$ORIGEN" >/dev/null 2>&1 || fail "VIDEOTV.zip está incompleto o dañado."
 
-  status_write processing "Extrayendo videos" "Preparando los archivos" 12 0 ""
-  ditto -x -k "$ORIGEN" "$WORK/source" || fail "No pude extraer VIDEOTV.zip."
-  SOURCE="$WORK/source"
+      status_write processing "Extrayendo videos" "Preparando los archivos" 12 0 ""
+      ditto -x -k "$ORIGEN" "$WORK/source" || fail "No pude extraer VIDEOTV.zip."
+      SOURCE="$WORK/source"
+      ;;
+  esac
 else
   SOURCE="$ORIGEN"
 fi
@@ -131,15 +157,18 @@ find "$SOURCE" -type f \
 
 [ -s "$RAW_LIST" ] || fail "La descarga no contiene videos MP4, MOV o M4V."
 
-perl -e '
-  chomp(@x = <>);
-  sub key {
-    my $s = lc(shift);
-    $s =~ s/(\d+)/sprintf("%020d",$1)/ge;
-    return $s;
+# Orden natural portable: clave numérica inicial + ruta.
+# Evita depender de la versión de Perl que hereda la Acción de carpeta.
+awk '
+  {
+    p = $0;
+    n = p;
+    sub(/.*\//, "", n);
+    if (match(n, /^[0-9]+/)) num = substr(n, RSTART, RLENGTH) + 0;
+    else num = 0;
+    printf "%010d\t%s\n", num, p;
   }
-  print "$_\n" for sort { key($a) cmp key($b) } @x;
-' "$RAW_LIST" > "$SORTED_LIST"
+' "$RAW_LIST" | sort -n -k1,1 | cut -f2- > "$SORTED_LIST"
 
 TOTAL=$(wc -l < "$SORTED_LIST" | tr -d ' ')
 [ "${TOTAL:-0}" -gt 0 ] || fail "No pude identificar los videos de la descarga."
@@ -229,6 +258,9 @@ if grep -Ev '^[[:space:]]*(#|$)' "$USB_ALLOWLIST" 2>/dev/null | grep -q .; then
   ALLOWLIST_ACTIVE=1
 fi
 
+FINAL_KB=$(du -k "$FINAL_TEMP" 2>/dev/null | awk '{print $1}')
+[ -n "$FINAL_KB" ] || FINAL_KB=0
+
 USB_COUNT=0
 USB_DEST=""
 USB_NAME=""
@@ -246,6 +278,9 @@ for VOLUME in /Volumes/*; do
   [ "$INTERNAL" != "true" ] || continue
   [ "$READONLY" != "true" ] || continue
   [ -w "$VOLUME" ] || continue
+
+  FREE_KB=$(df -Pk "$VOLUME" 2>/dev/null | awk 'NR==2 {print $4}')
+  [ "${FREE_KB:-0}" -gt $((FINAL_KB + 102400)) ] || continue
 
   if [ "$ALLOWLIST_ACTIVE" -eq 1 ]; then
     [ -n "$UUID" ] || continue
@@ -272,6 +307,7 @@ PARTIAL="$FINAL_PATH.parcial"
 rm -f "$PARTIAL" 2>/dev/null || true
 
 if ! cp "$FINAL_TEMP" "$PARTIAL"; then
+  rm -f "$PARTIAL" 2>/dev/null || true
   if [ "$DEST_KIND" = "usb" ]; then
     DEST="$DESCARGAS"
     DEST_KIND="downloads"
@@ -291,6 +327,11 @@ verify_video "$PARTIAL" || {
   fail "La copia final no pasó la verificación."
 }
 
+# En Descargas conservamos el video anterior en la Papelera.
+if [ "$DEST_KIND" = "downloads" ] && [ -e "$FINAL_PATH" ]; then
+  move_to_trash "$FINAL_PATH" || true
+fi
+
 mv -f "$PARTIAL" "$FINAL_PATH" || fail "No se pudo finalizar VIDEOTV.mp4."
 sync
 verify_video "$FINAL_PATH" || fail "VIDEOTV.mp4 no pasó la verificación final."
@@ -298,8 +339,12 @@ verify_video "$FINAL_PATH" || fail "VIDEOTV.mp4 no pasó la verificación final.
 register_success "$CONTENT_HASH" "$FINAL_PATH"
 
 # Limpieza estricta: SOLO la entrada exacta usada.
-status_write processing "Limpiando descarga" "Moviendo la fuente utilizada a la Papelera" 98 0 ""
-move_to_trash "$ORIGEN" || true
+if [ "$ORIGEN" = "$FINAL_PATH" ]; then
+  echo "La fuente es el mismo archivo final; no se mueve a la Papelera."
+else
+  status_write processing "Limpiando descarga" "Moviendo la fuente utilizada a la Papelera" 98 0 ""
+  move_to_trash "$ORIGEN" || true
+fi
 
 EJECTED=0
 if [ "$DEST_KIND" = "usb" ]; then
@@ -320,8 +365,44 @@ if [ "$DEST_KIND" = "usb" ]; then
     notify "VIDEOTV listo" "Guardado en USB. Expúlsala desde Finder antes de retirarla."
   fi
 else
-  status_write success "VIDEOTV listo" "Guardado en Descargas" 100 0 "$FINAL_PATH"
-  notify "VIDEOTV listo" "VIDEOTV.mp4 quedó guardado en Descargas."
+  # Solo enviar si NO habia ninguna USB apta detectada y Mail no esta en off.
+  MAIL_MODE=$(mail_mode)
+  if [ "$USB_COUNT" -eq 0 ] && [ "$MAIL_MODE" != "off" ] && [ -x "$MAIL_HELPER" ]; then
+    echo "Preparando borrador en Apple Mail: $FINAL_PATH"
+    "$MAIL_HELPER" "$FINAL_PATH"
+    MAIL_RC=$?
+    case "$MAIL_RC" in
+      0)
+        status_write success "VIDEOTV listo" "Correo entregado a Mail · MP4 en Descargas" 100 0 "$FINAL_PATH"
+        notify "VIDEOTV listo" "Correo entregado a Apple Mail."
+        ;;
+      10)
+        status_write preview "Borrador de Mail listo" "Revísalo y envíalo tú" 100 0 "$FINAL_PATH"
+        notify "VIDEOTV" "Borrador creado en Mail. Revísalo y envíalo tú."
+        ;;
+      13)
+        status_write success "VIDEOTV listo" "Guardado en Descargas · Mail desactivado" 100 0 "$FINAL_PATH"
+        notify "VIDEOTV listo" "VIDEOTV.mp4 quedó guardado en Descargas."
+        ;;
+      14)
+        status_write success "VIDEOTV listo" "Guardado en Descargas · Demasiado grande para Mail" 100 0 "$FINAL_PATH"
+        notify "VIDEOTV" "Video guardado. Supera el límite de Mail; no se envió."
+        ;;
+      11)
+        status_write error "Envío sin confirmar" "Video guardado · Revisa Enviados y Bandeja de salida" 100 0 "$FINAL_PATH"
+        notify "VIDEOTV" "No se confirmó el correo. No se reenviará automáticamente."
+        exit 1
+        ;;
+      *)
+        # El correo es opcional: si falla, el video ya está guardado y no se
+        # muestra un error al usuario.
+        status_write success "VIDEOTV listo" "Guardado en Descargas · Correo no preparado" 100 0 "$FINAL_PATH"
+        ;;
+    esac
+  else
+    status_write success "VIDEOTV listo" "Guardado en Descargas · No se envió correo" 100 0 "$FINAL_PATH"
+    notify "VIDEOTV listo" "VIDEOTV.mp4 quedó guardado en Descargas."
+  fi
 fi
 
 sleep 4

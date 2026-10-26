@@ -1,0 +1,8 @@
+.DS_Store
+*.log
+*.zip
+*.mp4
+*.parcial
+
+# Copia de respaldo local; no forma parte del proyecto
+tvx_ORIGINAL/
